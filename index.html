@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Tropical Island — Voxel</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#87ceeb;height:100%;width:100%;
+    -webkit-user-select:none;user-select:none;touch-action:none;
+    font-family:-apple-system,sans-serif;}
+  #c{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;top:env(safe-area-inset-top,12px);left:0;right:0;text-align:center;
+    color:#fff;text-shadow:0 1px 6px rgba(0,0,0,.4);pointer-events:none;padding-top:12px;}
+  #hud h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.5px;}
+  #hud p{font-size:11px;margin:4px 0 0;opacity:.85;}
+  #btns{position:fixed;bottom:calc(env(safe-area-inset-bottom,8px) + 14px);left:0;right:0;
+    display:flex;justify-content:center;gap:10px;}
+  #btns button{pointer-events:auto;background:rgba(255,255,255,.18);backdrop-filter:blur(8px);
+    -webkit-backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.35);color:#fff;
+    border-radius:20px;padding:8px 18px;font-size:13px;font-weight:600;}
+  #btns button.on{background:rgba(255,255,255,.45);color:#14507a;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><h1>🏝️ Tropical Island</h1><p>drag to orbit · pinch to zoom</p></div>
+<div id="btns">
+  <button id="rot" class="on">⟳ Auto-spin</button>
+  <button id="day">🌅 Sunset</button>
+</div>
+<script>
+"use strict";
+// ==================== tiny WebGL2 voxel renderer (no libraries) ====================
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) { document.body.innerHTML = '<p style="color:#fff;padding:2em">WebGL2 not available — open this file in Safari.</p>'; throw new Error('no webgl2'); }
+
+const VS = `#version 300 es
+in vec3 aPos; in vec3 aNorm; in vec3 aOff; in vec3 aScl;
+uniform mat4 uProj, uView;
+uniform float uTime, uWave;
+uniform vec3 uDrift;
+out vec3 vN, vW;
+void main(){
+  vec3 p = aPos * aScl + aOff;
+  if (uWave > 0.5) p.y += sin(uTime*1.6 + aOff.x*0.55 + aOff.z*0.4) * 0.09;
+  p += uDrift;
+  vN = aNorm; vW = p;
+  gl_Position = uProj * uView * vec4(p, 1.0);
+}`;
+const FS = `#version 300 es
+precision mediump float;
+in vec3 vN, vW; out vec4 o;
+uniform vec3 uColor, uSunDir, uSunCol, uGround, uFog, uCam;
+uniform float uEmis, uAlpha; uniform vec2 uFogR;
+void main(){
+  vec3 n = normalize(vN);
+  float hemi = mix(0.55, 1.0, n.y*0.5+0.5);
+  float d = max(dot(n, uSunDir), 0.0);
+  vec3 col = uColor * (hemi*0.5 + d*uSunCol) + uColor*uGround*0.08;
+  if (uEmis > 0.5) col = uColor;
+  float f = clamp((length(vW - uCam) - uFogR.x) / (uFogR.y - uFogR.x), 0.0, 1.0);
+  o = vec4(mix(col, uFog, f), uAlpha);
+}`;
+function shader(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = {}; for (const n of ['uProj','uView','uTime','uWave','uDrift','uColor','uSunDir','uSunCol','uGround','uFog','uCam','uEmis','uAlpha','uFogR'])
+  U[n] = gl.getUniformLocation(prog, n);
+
+// unit cube
+const C = [-1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1, -1,-1,1, 1,-1,1, 1,1,1, -1,1,1];
+const F = [[4,5,6,7, 0,0,1],[0,3,2,1, 0,0,-1],[3,7,6,2, 0,1,0],[0,1,5,4, 0,-1,0],[1,2,6,5, 1,0,0],[4,7,3,0, -1,0,0]];
+const vpos = [], vnorm = [], idx = [];
+F.forEach((f, fi) => {
+  const [a,b,c,d, nx,ny,nz] = f;
+  for (const v of [a,b,c,d]) vpos.push(C[v*3]/2, C[v*3+1]/2, C[v*3+2]/2), vnorm.push(nx,ny,nz);
+  idx.push(fi*4, fi*4+1, fi*4+2, fi*4, fi*4+2, fi*4+3);
+});
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+function buf(loc, data, size) {
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+}
+buf(gl.getAttribLocation(prog,'aPos'), new Float32Array(vpos), 3);
+buf(gl.getAttribLocation(prog,'aNorm'), new Float32Array(vnorm), 3);
+const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+
+// per-instance buffers
+const aOff = gl.getAttribLocation(prog,'aOff'), aScl = gl.getAttribLocation(prog,'aScl');
+function makeGroup(list) {
+  const d = new Float32Array(list.length * 6);
+  list.forEach((v,i) => { d.set(v, i*6); });
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(aOff); gl.vertexAttribPointer(aOff, 3, gl.FLOAT, false, 24, 0); gl.vertexAttribDivisor(aOff, 1);
+  gl.enableVertexAttribArray(aScl); gl.vertexAttribPointer(aScl, 3, gl.FLOAT, false, 24, 12); gl.vertexAttribDivisor(aScl, 1);
+  return { buf: b, count: list.length, list, data: d };
+}
+
+// ==================== mat4 math ====================
+function perspective(fov, asp, n, f) {
+  const t = 1/Math.tan(fov/2), nf = 1/(n-f);
+  return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)*nf,-1, 0,0,2*f*n*nf,0]);
+}
+function lookAt(e, c, up) {
+  let zx=e[0]-c[0], zy=e[1]-c[1], zz=e[2]-c[2];
+  let l=1/Math.hypot(zx,zy,zz); zx*=l; zy*=l; zz*=l;
+  let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  l=1/Math.hypot(xx,xy,xz); xx*=l; xy*=l; xz*=l;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  return new Float32Array([xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1]);
+}
+
+// ==================== scene generation ====================
+function hash(x, y) { let h = Math.sin(x*127.1 + y*311.7) * 43758.5453; return h - Math.floor(h); }
+function sm(t){ return t*t*(3-2*t); }
+function noise(x, y) {
+  const xi=Math.floor(x), yi=Math.floor(y), xf=x-xi, yf=y-yi;
+  const a=hash(xi,yi), b=hash(xi+1,yi), c=hash(xi,yi+1), d=hash(xi+1,yi+1);
+  const u=sm(xf), v=sm(yf);
+  return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;
+}
+const fbm = (x,y) => 0.55*noise(x,y) + 0.28*noise(x*2.1+7.3, y*2.1-3.1) + 0.17*noise(x*4.7-11.7, y*4.7+5.2);
+
+const N = 40, WATER = 2.0;
+const heightAt = (x, z) => {
+  const r = Math.hypot(x, z) / (N*0.42);
+  const falloff = Math.max(0, 1 - r*r*1.15);
+  const n = fbm(x*0.16+40, z*0.16+40);
+  return Math.max(-1, Math.floor(falloff*(4+n*9) + n*1.5));
+};
+
+const palette = {
+  deepWater:[0.10,0.42,0.58], water:[0.18,0.62,0.84], shallow:[0.33,0.78,0.91],
+  sand:[0.95,0.87,0.68], wetSand:[0.89,0.79,0.56],
+  grass:[0.36,0.72,0.36], grass2:[0.29,0.62,0.29], darkGrass:[0.24,0.52,0.25],
+  dirt:[0.54,0.42,0.29], rock:[0.60,0.60,0.62], rockDark:[0.49,0.49,0.51],
+  trunk:[0.54,0.35,0.17], leaf:[0.18,0.62,0.27], leafDark:[0.15,0.50,0.23],
+  hutWall:[0.85,0.73,0.54], hutRoof:[0.69,0.35,0.23],
+  flower:[0.91,0.36,0.46], flower2:[0.95,0.76,0.31],
+  cloud:[1,1,1], ocean:[0.09,0.38,0.55]
+};
+const groups = {}; for (const k in palette) groups[k] = [];
+const add = (k,x,y,z,sx=1,sy=1,sz=1) => groups[k].push([x,y,z,sx,sy,sz]);
+
+for (let x=-N/2; x<N/2; x++) for (let z=-N/2; z<N/2; z++) {
+  const h = heightAt(x,z);
+  if (h < WATER-1.2) { add('deepWater',x,-1,z); add('water',x,0,z); continue; }
+  if (h < WATER)     { add('shallow',x,0,z); continue; }
+  for (let y=0; y<=h; y++) {
+    if (y===h) {
+      if (h<=WATER+0.5) add('wetSand',x,y,z);
+      else if (h<=WATER+1.5) add('sand',x,y,z);
+      else if (h>=8) add('rock',x,y,z);
+      else { const r=hash(x*3.3,z*7.7); add(r<0.2?'grass2':r<0.32?'darkGrass':'grass',x,y,z); }
+    } else if (y>=h-1) add('dirt',x,y,z);
+    else add(h>=8?'rockDark':'dirt',x,y,z);
+  }
+}
+
+function palm(x, z) {
+  const top = heightAt(x,z), t = 4 + Math.floor(hash(x,z)*3);
+  const bend = hash(x+1,z+3) > 0.5 ? 1 : 0;
+  for (let i=0;i<t;i++) add('trunk', x + (bend && i>t/2 ? Math.floor(i-t/2) : 0), top+1+i, z);
+  const cy = top+1+t, cx = x + (bend ? Math.floor(t/2) : 0);
+  for (let a=0;a<6;a++) {
+    const ang = a*Math.PI/3 + hash(x,z+a)*0.6;
+    const dx = Math.round(Math.cos(ang)), dz = Math.round(Math.sin(ang));
+    for (let i=1;i<=3;i++) add(i%2?'leaf':'leafDark', cx+dx*i, cy+(i===3?-1:0), z+dz*i);
+    add((a+1)%2?'leaf':'leafDark', cx+dx*2, cy+1, z+dz*2);
+  }
+  add('flower', cx, cy+1, z);
+}
+const palms = []; let planted = 0;
+for (let tr=0; tr<400 && planted<8; tr++) {
+  const x = Math.floor((hash(tr*1.7,9.1)-0.5)*N*0.8), z = Math.floor((hash(3.3,tr*2.3)-0.5)*N*0.8);
+  const h = heightAt(x,z);
+  if (h>=WATER+1 && h<=5 && hash(x,z)>0.55) {
+    if (palms.some(([px,pz]) => Math.abs(px-x)<4 && Math.abs(pz-z)<4)) continue;
+    palms.push([x,z]); palm(x,z); planted++;
+  }
+}
+
+(function hut() {
+  let hx=0, hz=0;
+  outer: for (let x=-N/2;x<N/2;x++) for (let z=-N/2;z<N/2;z++) {
+    const h=heightAt(x,z); if (h>=WATER+2 && h<=5) { hx=x; hz=z; break outer; }
+  }
+  const base = heightAt(hx,hz);
+  for (let dx=0;dx<3;dx++) for (let dz=0;dz<3;dz++) { add('hutWall',hx+dx,base+1,hz+dz); add('hutWall',hx+dx,base+2,hz+dz); }
+  for (let dx=-1;dx<4;dx++) for (let dz=-1;dz<4;dz++) add('hutRoof',hx+dx,base+3,hz+dz);
+  for (let dx=0;dx<3;dx++) for (let dz=0;dz<3;dz++) add('hutRoof',hx+dx,base+4,hz+dz);
+  add('hutRoof',hx+1,base+5,hz+1);
+  const d = groups['hutWall'];
+  for (let i=d.length-1;i>=0;i--) if (d[i][0]===hx+1 && d[i][2]===hz && d[i][1]===base+1) d.splice(i,1);
+})();
+
+for (let x=-N/2;x<N/2;x+=2) for (let z=-N/2;z<N/2;z+=2) {
+  const h = heightAt(x,z);
+  if (h>WATER+2 && h<8 && hash(x*5.1,z*9.3)>0.86) add(hash(x,z)>0.5?'flower':'flower2', x,h+1,z,0.4,0.5,0.4);
+}
+
+// open ocean slab + clouds
+groups.ocean = [[0,-0.6,0,150,0.5,150]];
+const cloudDefs = [[-18,16,-12,4],[14,19,10,5],[20,15,-18,3.5],[-8,21,18,4.5]];
+const cloudList = [];
+for (const [cx,cy,cz,s] of cloudDefs) {
+  for (const [px,py,pz,ps] of [[0,0,0,s],[s,0,0,s*0.8],[-s*0.9,0,0,s*0.7],[s*0.4,0,s*0.6,s*0.6],[-s*0.3,0,-s*0.6,s*0.65]])
+    cloudList.push([cx+px,cy+py,cz+pz,ps,ps*0.6,ps]);
+}
+groups.cloud = cloudList;
+
+// build GPU groups (skip empty)
+const draws = [];
+for (const k in groups) if (groups[k].length) draws.push({ key: k, g: makeGroup(groups[k]) });
+const waterKeys = new Set(['water','shallow']);
+
+// ==================== camera / controls ====================
+let theta = 0.7, phi = 1.05, radius = 46;
+const target = [0, 3, 0];
+let autoRotate = true, dragging = false, lastX = 0, lastY = 0, pinchDist = 0;
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) { dragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; }
+  else if (e.touches.length === 2) { dragging = false;
+    pinchDist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY); }
+}, { passive: true });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (e.touches.length === 1 && dragging) {
+    theta -= (e.touches[0].clientX-lastX)*0.008;
+    phi = Math.min(1.5, Math.max(0.25, phi - (e.touches[0].clientY-lastY)*0.008));
+    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+  } else if (e.touches.length === 2) {
+    const d = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+    radius = Math.min(110, Math.max(16, radius * pinchDist / d));
+    pinchDist = d;
+  }
+}, { passive: false });
+canvas.addEventListener('touchend', () => { dragging = false; });
+canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+addEventListener('mousemove', e => { if (dragging) {
+  theta -= (e.clientX-lastX)*0.008; phi = Math.min(1.5, Math.max(0.25, phi-(e.clientY-lastY)*0.008));
+  lastX = e.clientX; lastY = e.clientY; } });
+addEventListener('mouseup', () => { dragging = false; });
+canvas.addEventListener('wheel', e => { radius = Math.min(110, Math.max(16, radius + e.deltaY*0.05)); }, { passive: true });
+
+// ==================== day / sunset ====================
+let sunset = 0, sunsetTarget = 0;
+const lerp = (a,b,t) => a+(b-a)*t;
+const lerp3 = (a,b,t) => [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)];
+const skyDay=[0.53,0.81,0.92], skySet=[0.97,0.63,0.36];
+const fogDay=[0.62,0.83,0.92], fogSet=[0.95,0.70,0.48];
+const sunDay=[0.55,0.94,0.82], sunSet=[1.0,0.55,0.30];
+document.getElementById('rot').addEventListener('click', e => {
+  autoRotate = !autoRotate; e.target.classList.toggle('on', autoRotate); });
+document.getElementById('day').addEventListener('click', e => {
+  sunsetTarget = sunsetTarget ? 0 : 1;
+  e.target.textContent = sunsetTarget ? '☀️ Day' : '🌅 Sunset'; });
+
+// ==================== render loop ====================
+function resize() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  canvas.width = innerWidth*dpr; canvas.height = innerHeight*dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener('resize', resize); resize();
+gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+const cloudBuf = draws.find(d => d.key === 'cloud');
+const cloudBase = cloudList.map(v => v.slice());
+let last = performance.now();
+function frame(now) {
+  const t = now/1000, dt = Math.min(0.05, (now-last)/1000); last = now;
+  if (autoRotate && !dragging) theta += dt*0.18;
+  sunset += (sunsetTarget - sunset)*0.04;
+
+  const eye = [target[0]+radius*Math.sin(phi)*Math.cos(theta),
+               target[1]+radius*Math.cos(phi),
+               target[2]+radius*Math.sin(phi)*Math.sin(theta)];
+  let sd = [0.55, 0.80, 0.35]; let sl = Math.hypot(...sd);
+  sd = [sd[0]/sl, sd[1]/sl - sunset*0.45, sd[2]/sl]; sl = Math.hypot(...sd);
+  sd = [sd[0]/sl, sd[1]/sl, sd[2]/sl];
+
+  gl.clearColor(...lerp3(skyDay, skySet, sunset), 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.uniformMatrix4fv(U.uProj, false, perspective(0.9, canvas.width/canvas.height, 0.5, 400));
+  gl.uniformMatrix4fv(U.uView, false, lookAt(eye, target, [0,1,0]));
+  gl.uniform3fv(U.uCam, eye);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform3f(U.uDrift, 0, 0, 0);
+  gl.uniform3fv(U.uSunDir, sd);
+  gl.uniform3fv(U.uSunCol, lerp3(sunDay, sunSet, sunset));
+  gl.uniform3fv(U.uGround, [0.25,0.2,0.15]);
+  gl.uniform3fv(U.uFog, lerp3(fogDay, fogSet, sunset));
+  gl.uniform2f(U.uFogR, 70, 190);
+  gl.uniform1f(U.uEmis, 0);
+
+  // drift clouds (CPU update, tiny buffer)
+  for (let i=0; i<cloudBase.length; i++) {
+    cloudBase[i][0] += dt * (i%2 ? 0.35 : 0.22);
+    if (cloudBase[i][0] > 60) cloudBase[i][0] = -60;
+    cloudBuf.g.data.set(cloudBase[i], i*6);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloudBuf.g.buf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, cloudBuf.g.data);
+
+  for (const d of draws) {
+    const col = palette[d.key];
+    gl.uniform3fv(U.uColor, col);
+    gl.uniform1f(U.uWave, waterKeys.has(d.key) ? 1 : 0);
+    gl.uniform1f(U.uAlpha, d.key==='water' ? 0.85 : (d.key==='shallow'||d.key==='deepWater') ? 0.8 : (d.key==='cloud' ? 0.92 : 1));
+    gl.uniform1f(U.uEmis, d.key==='cloud' ? 1 : 0);
+    if (d.key === 'cloud') gl.uniform2f(U.uFogR, 200, 400);
+    else gl.uniform2f(U.uFogR, 70, 190);
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, d.g.buf);
+    gl.enableVertexAttribArray(aOff); gl.vertexAttribPointer(aOff,3,gl.FLOAT,false,24,0); gl.vertexAttribDivisor(aOff,1);
+    gl.enableVertexAttribArray(aScl); gl.vertexAttribPointer(aScl,3,gl.FLOAT,false,24,12); gl.vertexAttribDivisor(aScl,1);
+    gl.drawElementsInstanced(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0, d.g.count);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
