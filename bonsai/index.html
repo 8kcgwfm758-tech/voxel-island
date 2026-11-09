@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Bonsai — Voxel</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#e9e2d4;height:100%;width:100%;
+    -webkit-user-select:none;user-select:none;touch-action:none;
+    font-family:-apple-system,sans-serif;}
+  #c{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;top:env(safe-area-inset-top,12px);left:0;right:0;text-align:center;
+    color:#3a332a;text-shadow:0 1px 6px rgba(255,255,255,.5);pointer-events:none;padding-top:12px;}
+  #hud h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.5px;}
+  #hud p{font-size:11px;margin:4px 0 0;opacity:.7;}
+  #btns{position:fixed;bottom:calc(env(safe-area-inset-bottom,8px) + 14px);left:0;right:0;
+    display:flex;justify-content:center;gap:10px;}
+  #btns button{pointer-events:auto;background:rgba(60,50,40,.12);backdrop-filter:blur(8px);
+    -webkit-backdrop-filter:blur(8px);border:1px solid rgba(60,50,40,.25);color:#3a332a;
+    border-radius:20px;padding:8px 18px;font-size:13px;font-weight:600;}
+  #btns button.on{background:rgba(60,50,40,.3);color:#fff;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><h1>🎋 Bonsai</h1><p>drag to orbit · pinch to zoom</p></div>
+<div id="btns">
+  <button id="rot" class="on">⟳ Auto-spin</button>
+  <button id="day">🌙 Evening</button>
+</div>
+<script>
+"use strict";
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) { document.body.innerHTML = '<p style="padding:2em">WebGL2 not available — open in Safari.</p>'; throw new Error('no webgl2'); }
+
+const VS = `#version 300 es
+in vec3 aPos; in vec3 aNorm; in vec3 aOff; in vec3 aScl;
+uniform mat4 uProj, uView;
+uniform float uTime, uWave;
+out vec3 vN, vW;
+void main(){
+  vec3 p = aPos * aScl + aOff;
+  if (uWave > 1.5) p.x += sin(uTime*1.3 + aOff.x*1.7 + aOff.y*0.9) * 0.035;   // leaf flutter
+  else if (uWave > 0.5) p.y += sin(uTime*1.6 + aOff.x*0.55 + aOff.z*0.4) * 0.09;
+  vN = aNorm; vW = p;
+  gl_Position = uProj * uView * vec4(p, 1.0);
+}`;
+const FS = `#version 300 es
+precision mediump float;
+in vec3 vN, vW; out vec4 o;
+uniform vec3 uColor, uSunDir, uSunCol, uGround, uFog, uCam;
+uniform float uEmis, uAlpha; uniform vec2 uFogR;
+void main(){
+  vec3 n = normalize(vN);
+  float hemi = mix(0.55, 1.0, n.y*0.5+0.5);
+  float d = max(dot(n, uSunDir), 0.0);
+  vec3 col = uColor * (hemi*0.5 + d*uSunCol) + uColor*uGround*0.08;
+  if (uEmis > 0.5) col = uColor;
+  float f = clamp((length(vW - uCam) - uFogR.x) / (uFogR.y - uFogR.x), 0.0, 1.0);
+  o = vec4(mix(col, uFog, f), uAlpha);
+}`;
+function shader(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = {}; for (const n of ['uProj','uView','uTime','uWave','uColor','uSunDir','uSunCol','uGround','uFog','uCam','uEmis','uAlpha','uFogR'])
+  U[n] = gl.getUniformLocation(prog, n);
+
+const C = [-1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1, -1,-1,1, 1,-1,1, 1,1,1, -1,1,1];
+const F = [[4,5,6,7, 0,0,1],[0,3,2,1, 0,0,-1],[3,7,6,2, 0,1,0],[0,1,5,4, 0,-1,0],[1,2,6,5, 1,0,0],[4,7,3,0, -1,0,0]];
+const vpos = [], vnorm = [], idx = [];
+F.forEach((f, fi) => {
+  const [a,b,c,d, nx,ny,nz] = f;
+  for (const v of [a,b,c,d]) vpos.push(C[v*3]/2, C[v*3+1]/2, C[v*3+2]/2), vnorm.push(nx,ny,nz);
+  idx.push(fi*4, fi*4+1, fi*4+2, fi*4, fi*4+2, fi*4+3);
+});
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+function buf(loc, data, size) {
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+}
+buf(gl.getAttribLocation(prog,'aPos'), new Float32Array(vpos), 3);
+buf(gl.getAttribLocation(prog,'aNorm'), new Float32Array(vnorm), 3);
+const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+const aOff = gl.getAttribLocation(prog,'aOff'), aScl = gl.getAttribLocation(prog,'aScl');
+function makeGroup(list) {
+  const d = new Float32Array(list.length * 6);
+  list.forEach((v,i) => { d.set(v, i*6); });
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(aOff); gl.vertexAttribPointer(aOff, 3, gl.FLOAT, false, 24, 0); gl.vertexAttribDivisor(aOff, 1);
+  gl.enableVertexAttribArray(aScl); gl.vertexAttribPointer(aScl, 3, gl.FLOAT, false, 24, 12); gl.vertexAttribDivisor(aScl, 1);
+  return { buf: b, count: list.length, data: d };
+}
+function perspective(fov, asp, n, f) {
+  const t = 1/Math.tan(fov/2), nf = 1/(n-f);
+  return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)*nf,-1, 0,0,2*f*n*nf,0]);
+}
+function lookAt(e, c, up) {
+  let zx=e[0]-c[0], zy=e[1]-c[1], zz=e[2]-c[2];
+  let l=1/Math.hypot(zx,zy,zz); zx*=l; zy*=l; zz*=l;
+  let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+  l=1/Math.hypot(xx,xy,xz); xx*=l; xy*=l; xz*=l;
+  const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  return new Float32Array([xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1]);
+}
+
+// ==================== bonsai scene ====================
+let seed = 12.9898;
+function rnd() { seed += 0.75487766; let h = Math.sin(seed) * 43758.5453; return h - Math.floor(h); }
+function hash(x, y) { let h = Math.sin(x*127.1 + y*311.7) * 43758.5453; return h - Math.floor(h); }
+
+const palette = {
+  trunk:     [0.40,0.27,0.18], trunkDark:[0.30,0.20,0.14], trunkLight:[0.50,0.35,0.24],
+  barkMoss:  [0.36,0.45,0.25],
+  leaf:      [0.24,0.55,0.22], leafMid:[0.30,0.64,0.26], leafLight:[0.42,0.72,0.30], leafDeep:[0.17,0.42,0.19],
+  bud:       [0.85,0.55,0.60],
+  pot:       [0.34,0.26,0.24], potRim:[0.44,0.34,0.30],
+  soil:      [0.36,0.27,0.19], soilLight:[0.45,0.35,0.25],
+  moss:      [0.35,0.55,0.22],
+  stone:     [0.55,0.55,0.57], stoneDark:[0.44,0.44,0.47],
+  wood:      [0.45,0.30,0.19], woodDark:[0.34,0.22,0.14],
+  mat:       [0.62,0.60,0.48],
+};
+const groups = {}; for (const k in palette) groups[k] = [];
+const add = (k,x,y,z,s=0.5,sy=s,sz=s) => groups[k].push([x,y,z,s,sy,sz]);
+
+// ---------- display stand ----------
+const S = 0.42;
+for (let x=-5.5; x<=5.5; x+=S) for (let z=-4; z<=4; z+=S) add('wood', x, 0.25, z, S, 0.4, S);
+for (let x=-5.5; x<=5.5; x+=S) for (let z=-4; z<=4; z+=S)   // apron
+  if (Math.abs(x) > 5.0 || Math.abs(z) > 3.5) add('woodDark', x, -0.05, z, S, 0.3, S);
+for (const [lx,lz] of [[-4.9,-3.4],[4.9,-3.4],[-4.9,3.4],[4.9,3.4]])
+  for (let y=-0.4; y>=-2.2; y-=S) add('woodDark', lx, y, lz, 0.5, S, 0.5);
+// tatami mat floor
+for (let x=-16; x<=16; x+=S) for (let z=-14; z<=14; z+=S) add('mat', x, -2.5, z, S, S, S);
+
+// ---------- ceramic pot (shallow oval, tokoname style) ----------
+const PA = 4.4, PB = 3.0;   // ellipse radii
+for (let x=-PA; x<=PA; x+=S) for (let z=-PB; z<=PB; z+=S) {
+  const e  = (x/PA)**2 + (z/PB)**2;
+  const ei = (x/(PA-0.85))**2 + (z/(PB-0.85))**2;
+  if (e <= 1 && ei > 1) {
+    for (let y=0.75; y<=1.5; y+=S) add('pot', x, y, z, S, S, S);
+    add('potRim', x, 1.68, z, S, 0.3, S);   // lip
+  } else if (ei <= 1) {
+    add('soil', x, 0.72, z, S, S, S);       // pot floor
+    add('soil', x, 1.5, z, S, S, S);        // soil surface
+    if (hash(x*7.1,z*3.3) > 0.55) add('soilLight', x, 1.55, z, S, 0.25, S);
+    if (hash(x*2.2,z*9.4) > 0.78) add('moss', x, 1.58, z, S, 0.2, S);
+  }
+}
+// feet
+for (const [fx,fz] of [[-3.2,-1.9],[3.2,-1.9],[-3.2,1.9],[3.2,1.9]]) add('pot', fx, 0.55, fz, 0.6, 0.25, 0.6);
+// accent stone in pot
+for (let i=0;i<14;i++) add(hash(i,1)>0.5?'stone':'stoneDark', 2.4+rnd()*0.9, 1.55+rnd()*0.3, -1.1+rnd()*0.8, 0.38, 0.32, 0.38);
+
+// ---------- trunk (moyogi / informal upright) ----------
+const SOIL_Y = 1.75;
+const trunkPts = [];
+{
+  let y = SOIL_Y;
+  while (y <= 10.6) {
+    const t = (y - SOIL_Y) / (10.6 - SOIL_Y);
+    const swayX = Math.sin(t*Math.PI*2.5) * 0.62 * (1 - t*0.35);
+    const swayZ = Math.sin(t*Math.PI*1.6 + 1.2) * 0.42;
+    const lean  = t*t*1.5;
+    trunkPts.push([0.2 + swayX + lean, y, swayZ]);
+    y += 0.28;
+  }
+}
+function trunkRadius(t) { return 1.35 * Math.pow(1-t, 1.15) + 0.16; }
+trunkPts.forEach((p, i) => {
+  const t = i / trunkPts.length;
+  const r = trunkRadius(t);
+  for (let dx=-r; dx<=r; dx+=0.45) for (let dz=-r; dz<=r; dz+=0.45) {
+    if (dx*dx + dz*dz > r*r) continue;
+    const edge = (dx*dx+dz*dz) / (r*r);
+    let k = 'trunk';
+    const h = hash(p[0]*3+dx, p[2]*3+dz);
+    if (h > 0.86 && t < 0.5) k = 'barkMoss';
+    else if (edge > 0.72 && dx > 0) k = 'trunkLight';
+    else if (edge > 0.72) k = 'trunkDark';
+    else if (h > 0.55) k = 'trunkDark';
+    add(k, p[0]+dx, p[1], p[2]+dz, 0.46, 0.32, 0.46);
+  }
+});
+// nebari (surface roots)
+for (let i=0;i<6;i++) {
+  const ang = i*Math.PI/3 + 0.45;
+  const dx = Math.cos(ang), dz = Math.sin(ang)*0.75;
+  for (let s=0; s<5; s++) {
+    const r = 1.1 + s*0.42;
+    const y = SOIL_Y - s*0.06;
+    add(s%2?'trunk':'trunkDark', 0.2+dx*r, y, dz*r, 0.6-s*0.06, 0.35, 0.6-s*0.06);
+  }
+}
+// trunk scar / jin (deadwood) feature
+{
+  const p = trunkPts[Math.floor(trunkPts.length*0.35)];
+  for (let i=0;i<4;i++) add('stoneDark', p[0]+0.55, p[1]+i*0.28, p[2]+0.15, 0.4, 0.28, 0.35);
+}
+
+// ---------- branches + foliage pads ----------
+function pad(cx, cy, cz, rx, ry, rz) {
+  for (let dx=-rx; dx<=rx; dx+=0.5) for (let dy=-ry; dy<=ry; dy+=0.4) for (let dz=-rz; dz<=rz; dz+=0.5) {
+    const e = (dx/rx)**2 + (dy/ry)**2 + (dz/rz)**2;
+    if (e > 1 || hash(cx+dx*7.7, cz+dz*5.1+dy*3) < 0.22) continue;
+    let k = 'leaf';
+    const h = hash(cx*3+dx, cz*3+dz);
+    if (dy > ry*0.35) k = h > 0.5 ? 'leafLight' : 'leafMid';
+    else if (dy < -ry*0.3) k = 'leafDeep';
+    else k = h > 0.6 ? 'leafMid' : 'leaf';
+    add(k, cx+dx, cy+dy, cz+dz, 0.46, 0.36, 0.46);
+  }
+  // a few blossom buds
+  for (let i=0;i<3;i++) if (rnd() > 0.4) add('bud', cx+(rnd()-0.5)*rx*1.6, cy+ry*0.8, cz+(rnd()-0.5)*rz*1.6, 0.22, 0.22, 0.22);
+}
+function branch(px, py, pz, dir, len, rad, depth) {
+  let x=px, y=py, z=pz;
+  const steps = Math.round(len/0.4);
+  let [dx,dy,dz] = dir; const dl = Math.hypot(dx,dy,dz); dx/=dl; dy/=dl; dz/=dl;
+  for (let i=0;i<steps;i++) {
+    const t = i/steps;
+    x += dx*0.4; y += dy*0.4 - t*t*0.05; z += dz*0.4;   // droop
+    dy -= 0.018;
+    const r = rad*(1-t*0.75)+0.08;
+    add(depth? 'trunkDark':'trunk', x, y, z, r, r*0.8, r);
+    if (depth === 0 && t > 0.45 && hash(x*5,y*5) > 0.72 && i < steps-3) {
+      const sub = branch(x, y, z, [dx*0.6+(rnd()-0.5), 0.55, dz*0.6+(rnd()-0.5)], 1.6+rnd(), 0.3, 1);
+      pads.push([sub[0], sub[1]+0.45, sub[2], 1.1+rnd()*0.4, 0.5, 0.9+rnd()*0.3]);
+    }
+  }
+  return [x, y, z];
+}
+// classic alternating pads, decreasing size upward
+const pads = [];
+{
+  const levels = [
+    { y: 4.1, side: 1,  len: 5.2, pad: [2.1,0.75,1.7] },
+    { y: 5.4, side: -1, len: 4.8, pad: [2.0,0.7,1.6] },
+    { y: 6.7, side: 1,  len: 4.0, pad: [1.7,0.65,1.4] },
+    { y: 7.9, side: -1, len: 3.3, pad: [1.5,0.6,1.2] },
+    { y: 9.0, side: 1,  len: 2.4, pad: [1.3,0.55,1.1] },
+  ];
+  for (const L of levels) {
+    const idx = Math.min(trunkPts.length-1, Math.round((L.y-SOIL_Y)/0.28));
+    const p = trunkPts[idx];
+    const tip = branch(p[0], L.y, p[2], [L.side*(0.95+rnd()*0.15), 0.22, (rnd()-0.5)*0.6], L.len, 0.42, 0);
+    pads.push([tip[0]+L.side*0.5, tip[1]+0.5, tip[2], ...L.pad]);
+  }
+  // crown pad at apex
+  const ap = trunkPts[trunkPts.length-1];
+  pads.push([ap[0]+0.2, ap[1]+0.5, ap[2], 1.6, 0.6, 1.4]);
+}
+pads.forEach(p => pad(...p));
+
+// ==================== draw setup ====================
+const draws = [];
+for (const k in groups) if (groups[k].length) draws.push({ key: k, g: makeGroup(groups[k]) });
+const leafKeys = new Set(['leaf','leafMid','leafLight','leafDeep','bud']);
+
+// ==================== camera / controls ====================
+let theta = 0.6, phi = 1.18, radius = 19;
+const target = [0.4, 5.4, 0];
+let autoRotate = true, dragging = false, lastX = 0, lastY = 0, pinchDist = 0;
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) { dragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; }
+  else if (e.touches.length === 2) { dragging = false;
+    pinchDist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY); }
+}, { passive: true });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (e.touches.length === 1 && dragging) {
+    theta -= (e.touches[0].clientX-lastX)*0.008;
+    phi = Math.min(1.5, Math.max(0.35, phi - (e.touches[0].clientY-lastY)*0.008));
+    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+  } else if (e.touches.length === 2) {
+    const d = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+    radius = Math.min(45, Math.max(8, radius * pinchDist / d));
+    pinchDist = d;
+  }
+}, { passive: false });
+canvas.addEventListener('touchend', () => { dragging = false; });
+canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+addEventListener('mousemove', e => { if (dragging) {
+  theta -= (e.clientX-lastX)*0.008; phi = Math.min(1.5, Math.max(0.35, phi-(e.clientY-lastY)*0.008));
+  lastX = e.clientX; lastY = e.clientY; } });
+addEventListener('mouseup', () => { dragging = false; });
+canvas.addEventListener('wheel', e => { radius = Math.min(45, Math.max(8, radius + e.deltaY*0.03)); }, { passive: true });
+
+// ==================== day / evening ====================
+let evening = 0, eveningTarget = 0;
+const lerp = (a,b,t) => a+(b-a)*t;
+const lerp3 = (a,b,t) => [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)];
+const bgDay=[0.91,0.88,0.82], bgEve=[0.10,0.10,0.16];
+const sunDay=[0.62,0.55,0.42], sunEve=[0.85,0.45,0.22];
+document.getElementById('rot').addEventListener('click', e => {
+  autoRotate = !autoRotate; e.target.classList.toggle('on', autoRotate); });
+document.getElementById('day').addEventListener('click', e => {
+  eveningTarget = eveningTarget ? 0 : 1;
+  e.target.textContent = eveningTarget ? '☀️ Day' : '🌙 Evening'; });
+
+// ==================== render loop ====================
+function resize() {
+  const dpr = Math.min(devicePixelRatio, 2);
+  canvas.width = innerWidth*dpr; canvas.height = innerHeight*dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener('resize', resize); resize();
+gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+let last = performance.now();
+function frame(now) {
+  const t = now/1000, dt = Math.min(0.05, (now-last)/1000); last = now;
+  if (autoRotate && !dragging) theta += dt*0.16;
+  evening += (eveningTarget - evening)*0.04;
+
+  const eye = [target[0]+radius*Math.sin(phi)*Math.cos(theta),
+               target[1]+radius*Math.cos(phi),
+               target[2]+radius*Math.sin(phi)*Math.sin(theta)];
+  let sd = [0.6, 0.75 - evening*0.35, 0.4]; const sl = Math.hypot(...sd);
+  sd = [sd[0]/sl, sd[1]/sl, sd[2]/sl];
+
+  const bg = lerp3(bgDay, bgEve, evening);
+  gl.clearColor(...bg, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.uniformMatrix4fv(U.uProj, false, perspective(0.85, canvas.width/canvas.height, 0.2, 200));
+  gl.uniformMatrix4fv(U.uView, false, lookAt(eye, target, [0,1,0]));
+  gl.uniform3fv(U.uCam, eye);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform3fv(U.uSunDir, sd);
+  gl.uniform3fv(U.uSunCol, lerp3(sunDay, sunEve, evening));
+  gl.uniform3fv(U.uGround, [0.25,0.22,0.18]);
+  gl.uniform3fv(U.uFog, bg);
+  gl.uniform2f(U.uFogR, 26, 70);
+  gl.uniform1f(U.uAlpha, 1);
+  gl.uniform1f(U.uEmis, 0);
+
+  for (const d of draws) {
+    gl.uniform3fv(U.uColor, palette[d.key]);
+    gl.uniform1f(U.uWave, leafKeys.has(d.key) ? 2 : 0);
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, d.g.buf);
+    gl.enableVertexAttribArray(aOff); gl.vertexAttribPointer(aOff,3,gl.FLOAT,false,24,0); gl.vertexAttribDivisor(aOff,1);
+    gl.enableVertexAttribArray(aScl); gl.vertexAttribPointer(aScl,3,gl.FLOAT,false,24,12); gl.vertexAttribDivisor(aScl,1);
+    gl.drawElementsInstanced(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0, d.g.count);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
